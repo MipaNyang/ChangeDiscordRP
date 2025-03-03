@@ -4,144 +4,152 @@ using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 using UnityModManagerNet;
-using static UnityModManagerNet.UnityModManager;
 using Newtonsoft.Json;
 
 namespace ChangeDiscordRP
 {
     public class Main
     {
-        private static Harmony harmony;
-        private static ModSettings settings;
-        private static ModEntry modEntry;
+        private static Harmony _harmony;
+        private static UnityModManager.ModEntry _modEntry;
+        private static bool _isEnabled = false;
+        private static ModSettings _settings;
 
         [Serializable]
-        public class ModSettings : UnityModManager.ModSettings
+        public class ModSettings
         {
             public string CustomState = "Default State";
             public string CustomDetails = "Default Details";
             public string CustomLargeText = "Default Large Text";
 
-            private static string GetSettingsFilePath()
+            private static string GetSettingsPath(UnityModManager.ModEntry modEntry)
             {
-                string folderPath = modEntry.Path;
-                string filePath = Path.Combine(folderPath, "Settings.json");
-                return filePath;
+                return Path.Combine(modEntry.Path, "Settings.json");
             }
 
-            public override void Save(UnityModManager.ModEntry modEntry)
+            public void Save(UnityModManager.ModEntry modEntry)
             {
-                string json = JsonConvert.SerializeObject(this, Formatting.Indented);
-                string filePath = GetSettingsFilePath();
-                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-                File.WriteAllText(filePath, json);
+                File.WriteAllText(GetSettingsPath(modEntry), JsonConvert.SerializeObject(this, Formatting.Indented));
             }
 
-            public static ModSettings Load()
+            public static ModSettings Load(UnityModManager.ModEntry modEntry)
             {
-                string filePath = GetSettingsFilePath();
-
-                if (File.Exists(filePath))
+                string path = GetSettingsPath(modEntry);
+                if (File.Exists(path))
                 {
-                    string json = File.ReadAllText(filePath);
-                    return JsonConvert.DeserializeObject<ModSettings>(json);
+                    return JsonConvert.DeserializeObject<ModSettings>(File.ReadAllText(path)) ?? new ModSettings();
                 }
-
                 return new ModSettings();
             }
         }
 
-        public static bool Start(ModEntry entry)
+        public static bool Load(UnityModManager.ModEntry modEntry)
         {
-            modEntry = entry;
-            settings = ModSettings.Load();
+            _modEntry = modEntry;
+            _modEntry.OnToggle = OnToggle;
+            _modEntry.OnGUI = OnGUI;
+            _modEntry.OnSaveGUI = OnSaveGUI;
 
-            entry.OnToggle = (e, value) =>
-            {
-                if (value)
-                {
-                    harmony = new Harmony(entry.Info.Id);
-                    harmony.PatchAll(Assembly.GetExecutingAssembly());
-                }
-                else
-                {
-                    harmony?.UnpatchAll(entry.Info.Id);
-                }
-                return true;
-            };
-
-            entry.OnGUI = (e) =>
-            {
-                DrawSettingsUI();
-            };
+            _settings = ModSettings.Load(modEntry);
 
             return true;
         }
 
+        private static bool OnToggle(UnityModManager.ModEntry modEntry, bool value)
+        {
+            _isEnabled = value;
+            if (value)
+            {
+                _harmony = new Harmony(modEntry.Info.Id);
+                _harmony.PatchAll(Assembly.GetExecutingAssembly());
+            }
+            else
+            {
+                _harmony?.UnpatchAll(modEntry.Info.Id);
+                _harmony = null;
+            }
+            return true;
+        }
+
+        private static void OnGUI(UnityModManager.ModEntry modEntry)
+        {
+            DrawSettingsUI();
+        }
+
+        private static void OnSaveGUI(UnityModManager.ModEntry modEntry)
+        {
+            _settings.Save(modEntry);
+        }
+
         private static void DrawSettingsUI()
         {
-            GUILayout.BeginVertical();
+            GUILayout.Label("DiscordRichPresence", new GUIStyle(GUI.skin.label) { fontSize = 30, fontStyle = FontStyle.Bold });
+            GUILayout.Space(20);
 
-            GUILayout.Label("<b><size=30>ChangeDiscordRP</size></b>", GUILayout.Width(300));
+            DrawLabeledTextField("State:", ref _settings.CustomState);
+            DrawLabeledTextField("Details:", ref _settings.CustomDetails);
+            DrawLabeledTextField("Large Text:", ref _settings.CustomLargeText);
 
-            GUILayout.Label("Custom State");
-            settings.CustomState = GUILayout.TextField(settings.CustomState, GUILayout.Width(300));
+            GUILayout.Space(10);
+        }
 
-            GUILayout.Label("Custom Details");
-            settings.CustomDetails = GUILayout.TextField(settings.CustomDetails, GUILayout.Width(300));
-
-            GUILayout.Label("Custom Large Text");
-            settings.CustomLargeText = GUILayout.TextField(settings.CustomLargeText, GUILayout.Width(300));
-
-            if (GUILayout.Button("Save Settings"))
-            {
-                settings.Save(modEntry);
-            }
-
-            GUILayout.EndVertical();
+        private static void DrawLabeledTextField(string label, ref string fieldValue)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, GUILayout.Width(120));
+            fieldValue = GUILayout.TextField(fieldValue, GUILayout.ExpandWidth(true));
+            GUILayout.EndHorizontal();
         }
 
         [HarmonyPatch(typeof(DiscordController), "UpdatePresence")]
-        internal class DiscordMessagePatch
+        internal static class DiscordController_UpdatePresence_Patch
         {
             private static bool Prefix(DiscordController __instance)
             {
+                if (!_isEnabled)
+                {
+                    return true;
+                }
+
                 var discord = Traverse.Create(__instance).Field<global::Discord.Discord>("discord").Value;
 
                 if (discord == null)
                 {
-                    return false;
+                    _modEntry.Logger.Warning("[ChangeDiscordRP] Discord instance is null. Cannot update presence.");
+                    return true;
                 }
 
-                string customState = settings.CustomState;
-                string customDetails = settings.CustomDetails;
-                string customLargeText = settings.CustomLargeText;
-
-                var activity = new global::Discord.Activity
+                try
                 {
-                    State = Validate(customState),
-                    Details = Validate(customDetails),
-                    Assets =
+                    var activity = new global::Discord.Activity
                     {
-                        LargeImage = "planets_icon_stars",
-                        LargeText = Validate(customLargeText)
-                    }
-                };
+                        State = Validate(_settings.CustomState),
+                        Details = Validate(_settings.CustomDetails),
+                        Assets =
+                        {
+                            LargeImage = "planets_icon_stars",
+                            LargeText = Validate(_settings.CustomLargeText)
+                        }
+                    };
 
-                discord.GetActivityManager().UpdateActivity(activity, result =>
+                    discord.GetActivityManager().UpdateActivity(activity, result =>
+                    {
+                        if (result != global::Discord.Result.Ok)
+                        {
+                            _modEntry.Logger.Warning($"[ChangeDiscordRP] Discord UpdateActivity failed: {result}");
+                        }
+                    });
+                }
+                finally
                 {
-                });
+                }
 
                 return false;
             }
 
             private static string Validate(string s)
             {
-                if (s.Length <= 60)
-                {
-                    return s;
-                }
-                return s.Substring(0, 57) + "...";
+                return s.Length <= 128 ? s : s.Substring(0, 128) + "...";
             }
         }
     }
